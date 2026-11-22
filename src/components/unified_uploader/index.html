@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    body {
+      background-color: transparent;
+      color: #fafafa;
+      padding: 4px;
+    }
+    .drop-zone {
+      border: 2px dashed #4b5563;
+      border-radius: 8px;
+      padding: 24px 16px;
+      text-align: center;
+      background-color: #1e1e24;
+      cursor: pointer;
+      transition: border-color 0.2s, background-color 0.2s;
+      position: relative;
+    }
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: #ff4b4b;
+      background-color: #262730;
+    }
+    .upload-icon {
+      font-size: 32px;
+      margin-bottom: 8px;
+      display: block;
+    }
+    .main-text {
+      font-size: 15px;
+      font-weight: 600;
+      color: #f3f4f6;
+      margin-bottom: 4px;
+    }
+    .sub-text {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-bottom: 16px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      background-color: #374151;
+      color: #f9fafb;
+      border: 1px solid #4b5563;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.15s, border-color 0.15s;
+    }
+    .btn:hover {
+      background-color: #4b5563;
+      border-color: #6b7280;
+    }
+    .btn-clear {
+      background-color: #4b232b;
+      border-color: #7f1d1d;
+      color: #fca5a5;
+    }
+    .btn-clear:hover {
+      background-color: #7f1d1d;
+      color: #ffffff;
+    }
+    .status {
+      margin-top: 12px;
+      font-size: 12px;
+      color: #60a5fa;
+      word-break: break-all;
+    }
+    .error-msg {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #f87171;
+    }
+    input[type="file"] {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="drop-zone" id="drop-zone">
+    <span class="upload-icon">📂</span>
+    <div class="main-text">Drop your codebase here</div>
+    <div class="sub-text">ZIP archive, folder, or source files</div>
+    <div class="actions">
+      <button type="button" class="btn" id="btn-browse-files">Browse files / ZIP</button>
+      <button type="button" class="btn" id="btn-browse-folder">Browse folder</button>
+      <button type="button" class="btn btn-clear" id="btn-clear" style="display: none;">Clear</button>
+    </div>
+    <div class="status" id="status-text"></div>
+    <div class="error-msg" id="error-text"></div>
+  </div>
+
+  <input type="file" id="input-files" multiple accept=".zip,.*">
+  <input type="file" id="input-folder" webkitdirectory directory multiple>
+
+  <script>
+    const dropZone = document.getElementById("drop-zone");
+    const inputFiles = document.getElementById("input-files");
+    const inputFolder = document.getElementById("input-folder");
+    const btnBrowseFiles = document.getElementById("btn-browse-files");
+    const btnBrowseFolder = document.getElementById("btn-browse-folder");
+    const btnClear = document.getElementById("btn-clear");
+    const statusText = document.getElementById("status-text");
+    const errorText = document.getElementById("error-text");
+
+    let isReady = false;
+
+    function sendToStreamlit(value) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setComponentValue",
+        value: value
+      }, "*");
+    }
+
+    function setFrameHeight() {
+      const height = document.body.scrollHeight || 180;
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setFrameHeight",
+        height: height
+      }, "*");
+    }
+
+    function initComponent() {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+      }, "*");
+      isReady = true;
+      setTimeout(setFrameHeight, 50);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.data && event.data.type === "streamlit:render") {
+        setFrameHeight();
+      }
+    });
+
+    btnBrowseFiles.addEventListener("click", (e) => {
+      e.stopPropagation();
+      inputFiles.click();
+    });
+
+    btnBrowseFolder.addEventListener("click", (e) => {
+      e.stopPropagation();
+      inputFolder.click();
+    });
+
+    btnClear.addEventListener("click", (e) => {
+      e.stopPropagation();
+      inputFiles.value = "";
+      inputFolder.value = "";
+      statusText.textContent = "";
+      errorText.textContent = "";
+      btnClear.style.display = "none";
+      sendToStreamlit(null);
+      setFrameHeight();
+    });
+
+    // Drag and drop event listeners
+    ["dragenter", "dragover"].forEach(eventName => {
+      dropZone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.add("drag-over");
+      }, false);
+    });
+
+    ["dragleave", "drop"].forEach(eventName => {
+      dropZone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.remove("drag-over");
+      }, false);
+    });
+
+    dropZone.addEventListener("drop", async (e) => {
+      errorText.textContent = "";
+      statusText.textContent = "Scanning dropped files...";
+      setFrameHeight();
+
+      try {
+        const filesWithPaths = await getFilesFromDataTransfer(e.dataTransfer);
+        if (filesWithPaths.length === 0) {
+          statusText.textContent = "";
+          errorText.textContent = "No readable files found in drop.";
+          setFrameHeight();
+          return;
+        }
+        await processAndSendFiles(filesWithPaths);
+      } catch (err) {
+        statusText.textContent = "";
+        errorText.textContent = "Error reading files: " + err.message;
+        setFrameHeight();
+      }
+    });
+
+    inputFiles.addEventListener("change", async () => {
+      if (!inputFiles.files || inputFiles.files.length === 0) return;
+      errorText.textContent = "";
+      const filesWithPaths = [];
+      for (let i = 0; i < inputFiles.files.length; i++) {
+        const f = inputFiles.files[i];
+        filesWithPaths.push({ file: f, path: f.name });
+      }
+      await processAndSendFiles(filesWithPaths);
+    });
+
+    inputFolder.addEventListener("change", async () => {
+      if (!inputFolder.files || inputFolder.files.length === 0) return;
+      errorText.textContent = "";
+      const filesWithPaths = [];
+      for (let i = 0; i < inputFolder.files.length; i++) {
+        const f = inputFolder.files[i];
+        filesWithPaths.push({ file: f, path: f.webkitRelativePath || f.name });
+      }
+      await processAndSendFiles(filesWithPaths);
+    });
+
+    async function getFilesFromDataTransfer(dataTransfer) {
+      const filesList = [];
+      const items = dataTransfer.items;
+      if (items && items.length > 0 && items[0].webkitGetAsEntry) {
+        const entries = [];
+        for (let i = 0; i < items.length; i++) {
+          const entry = items[i].webkitGetAsEntry();
+          if (entry) entries.push(entry);
+        }
+        for (const entry of entries) {
+          await traverseEntry(entry, "", filesList);
+        }
+      } else if (dataTransfer.files && dataTransfer.files.length > 0) {
+        for (let i = 0; i < dataTransfer.files.length; i++) {
+          const f = dataTransfer.files[i];
+          filesList.push({ file: f, path: f.name });
+        }
+      }
+      return filesList;
+    }
+
+    async function traverseEntry(entry, pathSoFar, filesList) {
+      if (entry.isFile) {
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+        const fullPath = pathSoFar ? pathSoFar + "/" + entry.name : entry.name;
+        filesList.push({ file: file, path: fullPath });
+      } else if (entry.isDirectory) {
+        const dirReader = entry.createReader();
+        const dirPath = pathSoFar ? pathSoFar + "/" + entry.name : entry.name;
+        let entries = [];
+        let readMore = true;
+        while (readMore) {
+          const batch = await new Promise((resolve, reject) => dirReader.readEntries(resolve, reject));
+          if (batch.length > 0) {
+            entries = entries.concat(batch);
+          } else {
+            readMore = false;
+          }
+        }
+        for (const child of entries) {
+          await traverseEntry(child, dirPath, filesList);
+        }
+      }
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = reader.result;
+          const commaIndex = res.indexOf(",");
+          resolve(commaIndex !== -1 ? res.substring(commaIndex + 1) : res);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function processAndSendFiles(filesWithPaths) {
+      statusText.textContent = `Preparing ${filesWithPaths.length} file${filesWithPaths.length > 1 ? "s" : ""}...`;
+      setFrameHeight();
+
+      const payload = [];
+      for (const item of filesWithPaths) {
+        const b64 = await readFileAsBase64(item.file);
+        payload.push({
+          name: item.path,
+          content: b64,
+          size: item.file.size
+        });
+      }
+
+      if (payload.length === 1 && payload[0].name.toLowerCase().endsWith(".zip")) {
+        statusText.textContent = `✓ Loaded ZIP: ${payload[0].name}`;
+      } else if (payload.length === 1) {
+        statusText.textContent = `✓ Loaded: ${payload[0].name}`;
+      } else {
+        statusText.textContent = `✓ Loaded ${payload.length} files`;
+      }
+
+      btnClear.style.display = "inline-block";
+      setFrameHeight();
+      sendToStreamlit(payload);
+    }
+
+    // Initialize once DOM is loaded
+    document.addEventListener("DOMContentLoaded", initComponent);
+    setTimeout(initComponent, 100);
+  </script>
+</body>
+</html>
