@@ -11,6 +11,7 @@ import io
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, BinaryIO, Optional, Tuple, Union
 
@@ -20,6 +21,18 @@ import streamlit.components.v1 as components
 from src.chunker import chunk_repository
 from src.extractor import ExtractionError, SecurityError, safe_extract_zip
 from src.filter import filter_repository
+from src.llm import (
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_GROQ_PRIMARY_MODEL,
+    AllProvidersFailedError,
+    EmptyResponseError,
+    GeminiAPIError,
+    GroqAPIError,
+    LLMError,
+    MissingAPIKeyError,
+    RAGResponse,
+    generate_codebase_answer,
+)
 from src.models import RepoSummary
 from src.retriever import TFIDFRetriever
 
@@ -650,6 +663,7 @@ def main() -> None:
         st.session_state.pop("active_file_key", None)
         st.session_state.pop("retriever", None)
         st.session_state.pop("repo_summary", None)
+        st.session_state.pop("rag_result", None)
     else:
         try:
             preview_key = compute_unified_upload_key(items)
@@ -657,6 +671,7 @@ def main() -> None:
                 st.session_state.pop("active_file_key", None)
                 st.session_state.pop("retriever", None)
                 st.session_state.pop("repo_summary", None)
+                st.session_state.pop("rag_result", None)
 
                 with st.sidebar.status("Processing codebase…", expanded=True) as status:
                     retriever, summary, key = classify_and_process_upload(items)
@@ -668,11 +683,13 @@ def main() -> None:
             st.session_state.pop("active_file_key", None)
             st.session_state.pop("retriever", None)
             st.session_state.pop("repo_summary", None)
+            st.session_state.pop("rag_result", None)
             st.sidebar.error(str(err))
         except Exception as err:
             st.session_state.pop("active_file_key", None)
             st.session_state.pop("retriever", None)
             st.session_state.pop("repo_summary", None)
+            st.session_state.pop("rag_result", None)
             st.sidebar.error(f"An unexpected error occurred: {err}")
 
     # ------------------------------------------------ Repository statistics panel
@@ -696,54 +713,170 @@ def main() -> None:
             for path in summary.file_list:
                 st.caption(f"📄 {path}")
 
-    # ---------------------------------------------------------- Main search area
+    # --------------------------------------------------- Main Codebase Q&A area
     if retriever is None or not retriever.is_indexed:
         st.info("👈 Upload a repository ZIP, folder, or individual files in the sidebar to get started.")
         return
 
-    st.subheader("🔎 Search Codebase")
-    col_query, col_k = st.columns([4, 1])
+    st.subheader("💬 Ask Your Codebase")
+    st.caption(
+        "Powered by Groq with automatic multi-model fallback. Relevant code snippets are retrieved locally "
+        "using TF-IDF and provided as context to answer your question."
+    )
 
-    with col_query:
+    with st.form(key="ask_form", clear_on_submit=False):
         query = st.text_input(
-            "Natural language question or search query:",
-            placeholder="e.g. Where is database authentication configured?",
+            "Ask a question about this repository:",
+            placeholder="e.g. How does authentication work, or what does safe_extract_zip do?",
             key="query_input",
         )
+        submitted = st.form_submit_button("Ask", type="primary")
 
-    with col_k:
-        top_k = st.number_input(
-            "Top K results:",
-            min_value=1,
-            max_value=25,
-            value=5,
-            step=1,
-            key="top_k_input",
-        )
-
-    if query.strip():
-        results = retriever.search(query=query.strip(), top_k=int(top_k))
-
-        if not results:
-            st.warning("No matching code snippets found for this query.")
+    if submitted:
+        cleaned_query = query.strip()
+        if not cleaned_query:
+            st.warning("Please enter a question to ask your codebase.")
         else:
-            st.success(
-                f"Found {len(results)} relevant snippet{'s' if len(results) > 1 else ''}:"
+            start_total = time.time()
+            with st.status("Analyzing codebase…", expanded=True) as status:
+                # Stage 1: Searching codebase
+                status.update(label="Searching your codebase…")
+                t0 = time.time()
+                results = retriever.search(query=cleaned_query, top_k=3)
+                t_search = time.time() - t0
+                st.write(
+                    f"🔍 Stage 1: Found {len(results)} relevant snippet{'s' if len(results) != 1 else ''} ({t_search:.2f}s)"
+                )
+
+                # Stage 2: Preparing code context
+                status.update(label="Found relevant code. Preparing context…")
+                t1 = time.time()
+                t_context = time.time() - t1
+                st.write(f"📑 Stage 2: Code context prepared ({t_context:.2f}s)")
+
+                # Stage 3: Generating answer with live progress callback
+                status.update(label="Generating answer using Groq…")
+                t2 = time.time()
+
+                def on_status_update(msg: str) -> None:
+                    status.update(label=msg)
+                    st.write(f"🤖 {msg}")
+
+                try:
+                    rag_response = generate_codebase_answer(
+                        query=cleaned_query,
+                        results=results,
+                        on_status=on_status_update,
+                    )
+                    t_gen = time.time() - t2
+                    total_time = time.time() - start_total
+                    status.update(
+                        label=f"Answer generated in {total_time:.2f}s!",
+                        state="complete",
+                        expanded=False,
+                    )
+                    st.session_state["rag_result"] = {
+                        "query": cleaned_query,
+                        "response": rag_response,
+                        "duration": total_time,
+                        "sources": results,
+                    }
+                except AllProvidersFailedError as err:
+                    status.update(label="AI services temporarily unavailable", state="error", expanded=False)
+                    st.error("⚠️ AI services are temporarily unavailable. Please try again later.")
+                    st.session_state["rag_result"] = {
+                        "query": cleaned_query,
+                        "response": RAGResponse(
+                            answer="AI services are temporarily unavailable. Please try again later.",
+                            sources=results,
+                            provider="None",
+                            model="None",
+                            is_fallback=True,
+                        ),
+                        "duration": time.time() - start_total,
+                        "sources": results,
+                    }
+                except MissingAPIKeyError as err:
+                    status.update(label="API key error", state="error", expanded=False)
+                    st.error(f"⚠️ {err}")
+                    st.session_state["rag_result"] = {
+                        "query": cleaned_query,
+                        "response": RAGResponse(
+                            answer=f"Configuration error: {err}",
+                            sources=results,
+                            provider="None",
+                            model="None",
+                            is_fallback=True,
+                        ),
+                        "duration": time.time() - start_total,
+                        "sources": results,
+                    }
+                except (GroqAPIError, GeminiAPIError) as err:
+                    status.update(label="Provider error", state="error", expanded=False)
+                    st.error(f"⚠️ {err}")
+                    st.session_state["rag_result"] = {
+                        "query": cleaned_query,
+                        "response": RAGResponse(
+                            answer=f"AI service error: {err}",
+                            sources=results,
+                            provider="None",
+                            model="None",
+                            is_fallback=True,
+                        ),
+                        "duration": time.time() - start_total,
+                        "sources": results,
+                    }
+                except EmptyResponseError as err:
+                    status.update(label="Empty response", state="error", expanded=False)
+                    st.warning(f"⚠️ {err}")
+                    st.session_state["rag_result"] = {
+                        "query": cleaned_query,
+                        "response": RAGResponse(
+                            answer="The AI model returned an empty response. Please try rephrasing your question.",
+                            sources=results,
+                            provider="None",
+                            model="None",
+                            is_fallback=True,
+                        ),
+                        "duration": time.time() - start_total,
+                        "sources": results,
+                    }
+                except Exception as err:
+                    status.update(label="Generation failed", state="error", expanded=False)
+                    st.error(f"⚠️ An unexpected error occurred: {err}")
+
+    # Display current or preserved Q&A result
+    rag_data = st.session_state.get("rag_result")
+    if rag_data is not None:
+        response: RAGResponse = rag_data["response"]
+        st.markdown("### Answer")
+        st.markdown(response.answer)
+
+        # Provider and Model metadata badge
+        if response.provider != "None" and not response.is_fallback:
+            st.caption(f"Generated using {response.provider} · `{response.model}`")
+
+        sources = response.sources or rag_data.get("sources", [])
+        if sources:
+            st.divider()
+            st.subheader("📚 Verified References")
+            st.caption(
+                f"Based on {len(sources)} retrieved snippet{'s' if len(sources) != 1 else ''} from the indexed codebase:"
             )
-            for i, result in enumerate(results, start=1):
+            for i, result in enumerate(sources, start=1):
                 chunk = result.chunk
                 title = (
                     f"**#{i}** `{chunk.file_path}` "
                     f"(Lines {chunk.start_line}–{chunk.end_line}) — "
                     f"Similarity: `{result.score:.4f}`"
                 )
-                with st.expander(title, expanded=(i <= 3)):
+                with st.expander(title, expanded=(i <= 2)):
                     st.caption(
                         f"Language: **{chunk.language}** | Chunk ID: `{chunk.chunk_id}`"
                     )
                     st.code(chunk.content, language=chunk.language)
-    else:
-        st.caption("Enter a query above to search through indexed code snippets.")
+    elif not submitted:
+        st.caption("Ask any question above about functions, architecture, configuration, or logic in this repository.")
 
 
 if __name__ == "__main__":
