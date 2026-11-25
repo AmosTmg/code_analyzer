@@ -1,7 +1,22 @@
+
+# Web application framework
 streamlit>=1.35.0
+
+# Machine Learning
 scikit-learn>=1.4.0
+
+# Numerical computing
 numpy>=1.26.0
+
+# Testing framework
 pytest>=8.0.0
+
+# Google Gemini API
 google-genai>=3.6.1
+
+# Environment variable management
 python-dotenv>=1.2.2
+
+# Groq LLM API
 groq>=1.7.0
+
